@@ -2,7 +2,7 @@
   "$schema": "https://smapi.io/schemas/manifest.json",
   "Name": "Tillable Farm Grass",
   "Author": "ChromaMods",
-  "Version": "1.0",
+  "Version": "1.1",
   "Description": "Lets you till the permanent grass on your farm.",
   "UniqueID": "ChromaMods.TillableFarmGrass",
   "EntryDll": "TillableFarmGrass.dll",
