@@ -2,10 +2,13 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework.Graphics;
+using HarmonyLib;
 using StardewModdingAPI;
 using StardewModdingAPI.Events;
 using StardewValley;
 using StardewValley.TerrainFeatures;
+using StardewValley.Tools;
 using xTile;
 using xTile.Layers;
 using xTile.ObjectModel;
@@ -13,71 +16,122 @@ using xTile.Tiles;
 
 namespace TillableFarmGrass;
 
-/// <summary>Makes the permanent grass on every farm map tillable, and blends tilled grass into dirt patches until the soil is gone.</summary>
+/// <summary>Makes the permanent grass on every farm map tillable, and draws tilled grass as dirt that blends into the grass around it.</summary>
 internal sealed class ModEntry : Mod
 {
-    /// <summary>Tile property holding the tile index a changed tile had on the original map.</summary>
-    private const string GrassKey = "ChromaMods.TillableFarmGrass/Grass";
-
     /// <summary>The plain tillable dirt on the outdoors tile sheet.</summary>
     private const int DirtTile = 587;
 
-    /// <summary>Half-grass edge tiles on the outdoors tile sheet, which the game doesn't type as grass.</summary>
-    private static readonly HashSet<int> GrassEdges = new()
+    /// <summary>The farm mod data key listing the grass tiles cleared to dirt with a pickaxe, as "x,y" pairs.</summary>
+    private const string ClearedKey = "ChromaMods.TillableFarmGrass/Cleared";
+
+    /// <summary>Grass and half-grass tiles on the outdoors tile sheet that some farm maps don't type as grass.</summary>
+    private static readonly HashSet<int> GrassTiles = new()
     {
-        177, 178, 181, 182, 201, 202, 204, 225, 228, 229, 230, 251, 252, 423, 449, 567,
-        568, 569, 570, 592, 593, 594, 595, 619, 631, 632, 635, 655, 656, 679, 683, 684, 705, 706
+        177, 178, 179, 180, 181, 182, 200, 201, 202, 203, 204, 205, 225, 228, 229, 230, 250, 251, 252, 253,
+        254, 255, 256, 261, 276, 277, 278, 286, 300, 304, 311, 328, 329, 332, 353, 354, 355, 356, 357, 378,
+        379, 380, 381, 382, 401, 403, 404, 405, 406, 407, 423, 449, 567, 568, 569, 570, 592, 593, 594, 595,
+        619, 631, 632, 635, 655, 656, 679, 683, 684, 705, 706, 1092, 1093, 1094, 1095, 1119, 1120, 1121
     };
 
-    /// <summary>Plain light grass on the outdoors tile sheet, the only grass the blend pieces match.</summary>
-    private static readonly HashSet<int> LightGrass = new() { 150, 151, 152, 175, 275 };
+    /// <summary>Grass and dirt pieces on the outdoors tile sheet, indexed by which corners show dirt (NW 1, NE 2, SW 4, SE 8).</summary>
+    /// <remarks>No piece has dirt in two opposite corners only, so those combine two corner pieces.</remarks>
+    private static readonly int[][] Pieces =
+    {
+        Array.Empty<int>(), new[] { 253 }, new[] { 250 }, new[] { 251 }, new[] { 203 }, new[] { 228 }, new[] { 250, 203 }, new[] { 178 },
+        new[] { 200 }, new[] { 253, 200 }, new[] { 225 }, new[] { 252 }, new[] { 201 }, new[] { 177 }, new[] { 202 }, new[] { DirtTile }
+    };
 
-    /// <summary>Grass pieces on the outdoors tile sheet, indexed by which corners show dirt (NW 1, NE 2, SW 4, SE 8).</summary>
-    /// <remarks>No piece has dirt in two opposite corners only, so those become plain dirt.</remarks>
-    private static readonly int[] Pieces = { -1, 253, 250, 251, 203, 228, DirtTile, 178, 200, DirtTile, 225, 252, 201, 177, 202, DirtTile };
+    /// <summary>Dirt drawn over a ground tile, by tile sheet, index and corners, so it blends with any grass shade.</summary>
+    private static readonly Dictionary<(string Sheet, int Index, int Corners), Texture2D> blends = new();
+
+    /// <summary>The pixels of each outdoors tile sheet on the farm, by tile sheet ID.</summary>
+    private static readonly Dictionary<string, (Color[] Pixels, int Columns)> sheets = new();
+    private static TileSheet? mainSheet;
+    private static Map? loadedMap;
+    private static string? loadedSeason;
+    private static HashSet<Color> grassColors = new();
+    private static HashSet<Color> dirtColors = new();
+
+    /// <summary>Whether each colour seen on a ground tile counts as grass.</summary>
+    private static readonly Dictionary<Color, bool> grassLike = new();
+
+    private static string? clearedData;
+    private static HashSet<Point> cleared = new();
 
     public override void Entry(IModHelper helper)
     {
         helper.Events.Content.AssetRequested += OnAssetRequested;
-        helper.Events.GameLoop.DayStarted += OnDayStarted;
-        helper.Events.World.TerrainFeatureListChanged += OnTerrainFeatureListChanged;
+        var harmony = new Harmony(ModManifest.UniqueID);
+        harmony.Patch(
+            AccessTools.Method(typeof(Pickaxe), nameof(Pickaxe.DoFunction)),
+            prefix: new HarmonyMethod(typeof(ModEntry), nameof(BeforePickaxe)));
+        harmony.Patch(
+            AccessTools.Method(typeof(GameLocation), nameof(GameLocation.drawFloorDecorations)),
+            prefix: new HarmonyMethod(typeof(ModEntry), nameof(BeforeFloorDecorations)));
+    }
+
+    /// <summary>Clears farm grass to dirt when a pickaxe hits it with nothing on top, or turns cleared dirt back into grass.</summary>
+    private static void BeforePickaxe(GameLocation location, int x, int y, Farmer who)
+    {
+        Point tile = new(x / 64, y / 64);
+        if (location is not Farm farm || !IsGrassTile(farm.Map.GetLayer("Back"), tile.X, tile.Y)
+            || farm.IsTileOccupiedBy(tile.ToVector2(), CollisionMask.All & ~(CollisionMask.Characters | CollisionMask.Farmers)))
+            return;
+
+        // The pickaxe also hits an object up to 8 pixels into the next tile, which shouldn't clear the grass under the swing.
+        int nudgeX = who.FacingDirection % 2 == 0 ? 8 : 0, nudgeY = 8 - nudgeX;
+        if (farm.Objects.ContainsKey(new Vector2((x - nudgeX) / 64, (y - nudgeY) / 64)) || farm.Objects.ContainsKey(new Vector2((x + nudgeX) / 64, (y + nudgeY) / 64)))
+            return;
+
+        var tiles = new HashSet<Point>(Cleared(farm));
+        if (!tiles.Remove(tile))
+            tiles.Add(tile);
+        farm.modData[ClearedKey] = string.Join(" ", tiles.Select(point => $"{point.X},{point.Y}"));
+        farm.playSound("hoeHit", tile.ToVector2());
+    }
+
+    private static HashSet<Point> Cleared(Farm farm)
+    {
+        farm.modData.TryGetValue(ClearedKey, out string? data);
+        if (data != clearedData)
+        {
+            clearedData = data;
+            cleared = (data ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                .Select(pair => pair.Split(','))
+                .Select(pair => new Point(int.Parse(pair[0]), int.Parse(pair[1])))
+                .ToHashSet();
+        }
+        return cleared;
     }
 
     private static void OnAssetRequested(object? sender, AssetRequestedEventArgs e)
     {
-        if (!e.NameWithoutLocale.StartsWith("Maps/") || !FarmMapNames().Any(name => e.NameWithoutLocale.IsEquivalentTo("Maps/" + name)))
-            return;
-
-        e.Edit(asset =>
-        {
-            Map map = asset.AsMap().Data;
-            MakeGrassDiggable(map);
-
-            // Restores tilled grass when the map is reloaded mid-session.
-            if (Game1.getFarm() is Farm farm)
-                SyncDirt(farm, map);
-        }, AssetEditPriority.Late);
+        if (e.NameWithoutLocale.StartsWith("Maps/") && FarmMapNames().Any(name => e.NameWithoutLocale.IsEquivalentTo("Maps/" + name)))
+            e.Edit(asset => MakeGrassDiggable(asset.AsMap().Data), AssetEditPriority.Late);
     }
 
-    private static void OnDayStarted(object? sender, DayStartedEventArgs e)
+    /// <summary>Draws the dirt over the ground just before floors, so paths and stepping stones sit on top and the ground between them blends too.</summary>
+    private static void BeforeFloorDecorations(GameLocation __instance, SpriteBatch b)
     {
-        // Covers soil tilled before the save loaded, and soil that dried up overnight.
-        Farm farm = Game1.getFarm();
-        SyncDirt(farm, farm.Map);
-    }
-
-    private static void OnTerrainFeatureListChanged(object? sender, TerrainFeatureListChangedEventArgs e)
-    {
-        if (e.Location is not Farm farm)
+        if (__instance is not Farm farm || farm.Map.TileSheets.FirstOrDefault(IsMainSheet) is not TileSheet main)
             return;
 
+        if (loadedMap != farm.Map || loadedSeason != main.ImageSource)
+            LoadSheets(farm.Map, main);
+
+        Cleared(farm);
         Layer back = farm.Map.GetLayer("Back");
-        foreach (var pair in e.Added.Concat(e.Removed).Where(p => p.Value is HoeDirt))
+        int left = Game1.viewport.X / 64, top = Game1.viewport.Y / 64;
+        for (int x = left; x <= left + Game1.viewport.Width / 64 + 1; x++)
         {
-            for (int x = (int)pair.Key.X - 1; x <= pair.Key.X + 1; x++)
+            for (int y = top; y <= top + Game1.viewport.Height / 64 + 1; y++)
             {
-                for (int y = (int)pair.Key.Y - 1; y <= pair.Key.Y + 1; y++)
-                    Refresh(farm, back, x, y);
+                int corners = Corners(farm, back, x, y);
+                if (corners == 0)
+                    continue;
+                // Depth 0 sorts it under everything else in this front-to-back batch.
+                b.Draw(Blend(OutdoorsTile(back, x, y)!, corners), Game1.GlobalToLocal(Game1.viewport, new Vector2(x * 64, y * 64)), null, Color.White, 0f, Vector2.Zero, 4f, SpriteEffects.None, 0f);
             }
         }
     }
@@ -105,54 +159,30 @@ internal sealed class ModEntry : Mod
         }
     }
 
-    private static void SyncDirt(Farm farm, Map map)
+    /// <summary>Gets which corners of a tile show dirt: all of them if it's dirt grass, or the ones touching dirt grass.</summary>
+    /// <remarks>Any ground tile can get corners, so grass around stepping stones and cliff tops blends too.</remarks>
+    private static int Corners(Farm farm, Layer back, int x, int y)
     {
-        Layer back = map.GetLayer("Back");
-        for (int x = 0; x < back.LayerWidth; x++)
-        {
-            for (int y = 0; y < back.LayerHeight; y++)
-                Refresh(farm, back, x, y);
-        }
-    }
+        if (OutdoorsTile(back, x, y) == null)
+            return 0;
+        if (IsDirtGrass(farm, back, x, y))
+            return 15;
 
-    /// <summary>Shows a grass tile as dirt if it's tilled, as a blend piece if it borders tilled grass, or as the original map otherwise.</summary>
-    private static void Refresh(Farm farm, Layer back, int x, int y)
-    {
-        if (GrassTile(back, x, y) is not StaticTile tile)
-            return;
-
-        int original = Original(tile);
-        int shown = IsTilled(farm, x, y) ? DirtTile : Blend(farm, back, x, y, original);
-        if (shown == original)
-            tile.Properties.Remove(GrassKey);
-        else
-            tile.Properties[GrassKey] = original;
-        tile.TileIndex = shown;
-    }
-
-    private static int Blend(Farm farm, Layer back, int x, int y, int original)
-    {
-        int corners = Array.IndexOf(Pieces, original);
-        if (corners < 0)
-        {
-            if (!LightGrass.Contains(original))
-                return original;
-            corners = 0;
-        }
-
+        int corners = 0;
         for (int corner = 0; corner < 4; corner++)
         {
             int dx = corner % 2 == 0 ? -1 : 1;
             int dy = corner < 2 ? -1 : 1;
-            if (IsTilledGrass(farm, back, x + dx, y) || IsTilledGrass(farm, back, x, y + dy) || IsTilledGrass(farm, back, x + dx, y + dy))
+            if (IsDirtGrass(farm, back, x + dx, y) || IsDirtGrass(farm, back, x, y + dy) || IsDirtGrass(farm, back, x + dx, y + dy))
                 corners |= 1 << corner;
         }
-        return corners == 0 ? original : Pieces[corners];
+        return corners;
     }
 
-    private static bool IsTilledGrass(Farm farm, Layer back, int x, int y)
+    /// <summary>Whether a grass tile shows as dirt: tilled, or cleared with a pickaxe.</summary>
+    private static bool IsDirtGrass(Farm farm, Layer back, int x, int y)
     {
-        return GrassTile(back, x, y) != null && IsTilled(farm, x, y);
+        return IsGrassTile(back, x, y) && (IsTilled(farm, x, y) || cleared.Contains(new Point(x, y)));
     }
 
     private static bool IsTilled(Farm farm, int x, int y)
@@ -160,29 +190,127 @@ internal sealed class ModEntry : Mod
         return farm.terrainFeatures.TryGetValue(new Vector2(x, y), out var feature) && feature is HoeDirt;
     }
 
-    /// <summary>Gets a Back tile that was grass on the original map, if any.</summary>
-    private static StaticTile? GrassTile(Layer back, int x, int y)
+    private static bool IsGrassTile(Layer back, int x, int y)
+    {
+        return OutdoorsTile(back, x, y) is StaticTile tile && IsGrass(tile.TileSheet, tile.TileIndex);
+    }
+
+    private static StaticTile? OutdoorsTile(Layer back, int x, int y)
     {
         if (x < 0 || y < 0 || x >= back.LayerWidth || y >= back.LayerHeight)
             return null;
-        return back.Tiles[x, y] is StaticTile tile && IsOutdoorsSheet(tile.TileSheet) && IsGrass(tile.TileSheet, Original(tile)) ? tile : null;
+        return back.Tiles[x, y] is StaticTile tile && IsOutdoorsSheet(tile.TileSheet) ? tile : null;
     }
 
-    private static int Original(StaticTile tile)
+    private static void LoadSheets(Map map, TileSheet main)
     {
-        // The map is never saved, so the tile itself is the simplest place to remember what it was.
-        return tile.Properties.TryGetValue(GrassKey, out PropertyValue? original) ? original : tile.TileIndex;
+        foreach (Texture2D blend in blends.Values)
+            blend.Dispose();
+        blends.Clear();
+        sheets.Clear();
+        foreach (TileSheet sheet in map.TileSheets.Where(IsOutdoorsSheet))
+        {
+            Texture2D texture = Game1.content.Load<Texture2D>(sheet.ImageSource);
+            Color[] pixels = new Color[texture.Width * texture.Height];
+            texture.GetData(pixels);
+            sheets[sheet.Id] = (pixels, texture.Width / 16);
+        }
+        mainSheet = main;
+        loadedMap = map;
+        loadedSeason = main.ImageSource;
+
+        // Pixel art reuses exact palette colours, so the colours of the all-grass tiles tell grass from anything else
+        // in every season and under recolours, where judging by hue fails.
+        dirtColors = new HashSet<Color>(new[] { DirtTile, 176, 226, 227 }.SelectMany(index => TilePixels(main, index)));
+        grassColors = new HashSet<Color>();
+        grassLike.Clear();
+        foreach (TileSheet sheet in map.TileSheets.Where(IsOutdoorsSheet))
+        {
+            for (int index = 0; index < sheet.TileCount; index++)
+            {
+                if (IsGrass(sheet, index) && !TilePixels(sheet, index).Any(dirtColors.Contains))
+                    grassColors.UnionWith(TilePixels(sheet, index));
+            }
+        }
     }
 
-    private static bool IsOutdoorsSheet(TileSheet sheet)
+    /// <summary>Builds the dirt drawn over a ground tile for the given dirt corners.</summary>
+    private static Texture2D Blend(StaticTile tile, int corners)
+    {
+        var key = (tile.TileSheet.Id, tile.TileIndex, corners);
+        if (blends.TryGetValue(key, out Texture2D? texture))
+            return texture;
+
+        // A tile that's already a grass piece adds its own dirt corners, so its old edge is painted over. Any other
+        // tile only gets dirt over its grass pixels, so piece outlines never land on dirt, paths or stones.
+        int own = tile.TileSheet == mainSheet ? Array.FindIndex(Pieces, pieces => pieces.Length == 1 && pieces[0] == tile.TileIndex) : -1;
+        int[] shape = Pieces[corners | Math.Max(own, 0)];
+        Color[] pixels = new Color[256];
+        for (int pixel = 0; pixel < 256; pixel++)
+        {
+            if (own < 0 && corners != 15 && !IsGrassColor(Pixel(tile.TileSheet, tile.TileIndex, pixel)))
+                continue;
+            foreach (int piece in shape)
+            {
+                Color color = Pixel(mainSheet!, piece, pixel);
+                if (piece == DirtTile || !grassColors.Contains(color))
+                {
+                    pixels[pixel] = color;
+                    break;
+                }
+            }
+        }
+
+        texture = new Texture2D(Game1.graphics.GraphicsDevice, 16, 16);
+        texture.SetData(pixels);
+        blends[key] = texture;
+        return texture;
+    }
+
+    /// <summary>Whether a ground pixel is grass: a grass colour, or closer to one than to any dirt colour.</summary>
+    /// <remarks>Recolours don't always reuse the main sheet's greens on the second sheet, so near matches count too.</remarks>
+    private static bool IsGrassColor(Color color)
+    {
+        if (!grassLike.TryGetValue(color, out bool grass))
+        {
+            int toGrass = grassColors.Min(other => Distance(color, other));
+            grass = toGrass <= 40 * 40 && toGrass < dirtColors.Min(other => Distance(color, other));
+            grassLike[color] = grass;
+        }
+        return grass;
+    }
+
+    private static int Distance(Color a, Color b)
+    {
+        return (a.R - b.R) * (a.R - b.R) + (a.G - b.G) * (a.G - b.G) + (a.B - b.B) * (a.B - b.B);
+    }
+
+    private static Color Pixel(TileSheet sheet, int index, int pixel)
+    {
+        var (pixels, columns) = sheets[sheet.Id];
+        return pixels[((index / columns) * 16 + pixel / 16) * columns * 16 + (index % columns) * 16 + pixel % 16];
+    }
+
+    private static IEnumerable<Color> TilePixels(TileSheet sheet, int index)
+    {
+        return Enumerable.Range(0, 256).Select(pixel => Pixel(sheet, index, pixel));
+    }
+
+    private static bool IsMainSheet(TileSheet sheet)
     {
         // The season prefix changes as the game swaps seasonal tile sheets.
         return sheet.ImageSource.EndsWith("_outdoorsTileSheet");
     }
 
+    /// <summary>Whether a tile sheet is the main outdoors sheet or the second one 1.6 added, which farm maps also use for grass.</summary>
+    private static bool IsOutdoorsSheet(TileSheet sheet)
+    {
+        return IsMainSheet(sheet) || sheet.ImageSource.EndsWith("_outdoorsTileSheet2");
+    }
+
     private static bool IsGrass(TileSheet sheet, int index)
     {
-        return (IsOutdoorsSheet(sheet) && GrassEdges.Contains(index))
+        return (IsMainSheet(sheet) && GrassTiles.Contains(index))
             || (sheet.TileIndexProperties[index].TryGetValue("Type", out PropertyValue? type) && type.ToString() == "Grass");
     }
 }

@@ -1,5 +1,10 @@
 # Releases
 
+## 1.4 (2026-11-06)
+- Hit farm grass with a pickaxe to clear it to dirt. Hit it again to bring the grass back.
+- Soft dirt edges on every shade of grass, in every season and with recolour mods.
+- No more straight grass edges when tilling diagonally or next to paths and stepping stones.
+
 ## 1.3 (2026-11-05)
 - Tilled grass blends into the grass around it with soft edges instead of a hard square.
 - One more half-grass edge tile can be tilled.

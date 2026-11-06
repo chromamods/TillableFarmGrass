@@ -5,6 +5,7 @@
     <Nullable>enable</Nullable>
     <ModZipPath>$(MSBuildProjectDirectory)\dist</ModZipPath>
     <EnableModDeploy>false</EnableModDeploy>
+    <EnableHarmony>true</EnableHarmony>
     <PathMap>$(MSBuildProjectDirectory)=TillableFarmGrass</PathMap>
   </PropertyGroup>
 
