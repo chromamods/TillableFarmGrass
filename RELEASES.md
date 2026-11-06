@@ -1,5 +1,9 @@
 # Releases
 
+## 1.3 (2026-11-05)
+- Tilled grass blends into the grass around it with soft edges instead of a hard square.
+- One more half-grass edge tile can be tilled.
+
 ## 1.2 (2026-11-05)
 - Tilled grass goes back to grass when the soil is gone, whether you clear it with a pickaxe or it dries up overnight.
 

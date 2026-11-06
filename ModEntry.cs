@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using Microsoft.Xna.Framework;
@@ -12,10 +13,10 @@ using xTile.Tiles;
 
 namespace TillableFarmGrass;
 
-/// <summary>Makes the permanent grass on every farm map tillable, and shows tilled grass as plain dirt until the soil is gone.</summary>
+/// <summary>Makes the permanent grass on every farm map tillable, and blends tilled grass into dirt patches until the soil is gone.</summary>
 internal sealed class ModEntry : Mod
 {
-    /// <summary>Tile property holding the grass a tilled tile showed before it became dirt.</summary>
+    /// <summary>Tile property holding the tile index a changed tile had on the original map.</summary>
     private const string GrassKey = "ChromaMods.TillableFarmGrass/Grass";
 
     /// <summary>The plain tillable dirt on the outdoors tile sheet.</summary>
@@ -24,9 +25,16 @@ internal sealed class ModEntry : Mod
     /// <summary>Half-grass edge tiles on the outdoors tile sheet, which the game doesn't type as grass.</summary>
     private static readonly HashSet<int> GrassEdges = new()
     {
-        177, 178, 181, 182, 202, 204, 225, 228, 229, 230, 251, 252, 423, 449, 567, 568,
-        569, 570, 592, 593, 594, 595, 619, 631, 632, 635, 655, 656, 679, 683, 684, 705, 706
+        177, 178, 181, 182, 201, 202, 204, 225, 228, 229, 230, 251, 252, 423, 449, 567,
+        568, 569, 570, 592, 593, 594, 595, 619, 631, 632, 635, 655, 656, 679, 683, 684, 705, 706
     };
+
+    /// <summary>Plain light grass on the outdoors tile sheet, the only grass the blend pieces match.</summary>
+    private static readonly HashSet<int> LightGrass = new() { 150, 151, 152, 175, 275 };
+
+    /// <summary>Grass pieces on the outdoors tile sheet, indexed by which corners show dirt (NW 1, NE 2, SW 4, SE 8).</summary>
+    /// <remarks>No piece has dirt in two opposite corners only, so those become plain dirt.</remarks>
+    private static readonly int[] Pieces = { -1, 253, 250, 251, 203, 228, DirtTile, 178, 200, DirtTile, 225, 252, 201, 177, 202, DirtTile };
 
     public override void Entry(IModHelper helper)
     {
@@ -62,10 +70,16 @@ internal sealed class ModEntry : Mod
     {
         if (e.Location is not Farm farm)
             return;
-        foreach (var pair in e.Removed.Where(p => p.Value is HoeDirt))
-            Untill(farm.Map, pair.Key);
-        foreach (var pair in e.Added.Where(p => p.Value is HoeDirt))
-            Till(farm.Map, pair.Key);
+
+        Layer back = farm.Map.GetLayer("Back");
+        foreach (var pair in e.Added.Concat(e.Removed).Where(p => p.Value is HoeDirt))
+        {
+            for (int x = (int)pair.Key.X - 1; x <= pair.Key.X + 1; x++)
+            {
+                for (int y = (int)pair.Key.Y - 1; y <= pair.Key.Y + 1; y++)
+                    Refresh(farm, back, x, y);
+            }
+        }
     }
 
     private static IEnumerable<string> FarmMapNames()
@@ -91,48 +105,73 @@ internal sealed class ModEntry : Mod
         }
     }
 
-    /// <summary>Shows dirt under every hoed tile of the farm, and grass again where the soil is gone.</summary>
     private static void SyncDirt(Farm farm, Map map)
     {
         Layer back = map.GetLayer("Back");
         for (int x = 0; x < back.LayerWidth; x++)
         {
             for (int y = 0; y < back.LayerHeight; y++)
-            {
-                Vector2 tile = new(x, y);
-                if (farm.terrainFeatures.TryGetValue(tile, out var feature) && feature is HoeDirt)
-                    Till(map, tile);
-                else
-                    Untill(map, tile);
-            }
+                Refresh(farm, back, x, y);
         }
     }
 
-    private static void Till(Map map, Vector2 tile)
+    /// <summary>Shows a grass tile as dirt if it's tilled, as a blend piece if it borders tilled grass, or as the original map otherwise.</summary>
+    private static void Refresh(Farm farm, Layer back, int x, int y)
     {
-        if (BackTile(map, tile) is not StaticTile grass || !IsOutdoorsSheet(grass.TileSheet) || !IsGrass(grass.TileSheet, grass.TileIndex))
+        if (GrassTile(back, x, y) is not StaticTile tile)
             return;
 
-        // The map is never saved, so the tile itself is the simplest place to remember its grass.
-        grass.Properties[GrassKey] = grass.TileIndex;
-        grass.TileIndex = DirtTile;
+        int original = Original(tile);
+        int shown = IsTilled(farm, x, y) ? DirtTile : Blend(farm, back, x, y, original);
+        if (shown == original)
+            tile.Properties.Remove(GrassKey);
+        else
+            tile.Properties[GrassKey] = original;
+        tile.TileIndex = shown;
     }
 
-    private static void Untill(Map map, Vector2 tile)
+    private static int Blend(Farm farm, Layer back, int x, int y, int original)
     {
-        if (BackTile(map, tile) is not StaticTile dirt || !dirt.Properties.TryGetValue(GrassKey, out PropertyValue? grass))
-            return;
+        int corners = Array.IndexOf(Pieces, original);
+        if (corners < 0)
+        {
+            if (!LightGrass.Contains(original))
+                return original;
+            corners = 0;
+        }
 
-        dirt.TileIndex = grass;
-        dirt.Properties.Remove(GrassKey);
+        for (int corner = 0; corner < 4; corner++)
+        {
+            int dx = corner % 2 == 0 ? -1 : 1;
+            int dy = corner < 2 ? -1 : 1;
+            if (IsTilledGrass(farm, back, x + dx, y) || IsTilledGrass(farm, back, x, y + dy) || IsTilledGrass(farm, back, x + dx, y + dy))
+                corners |= 1 << corner;
+        }
+        return corners == 0 ? original : Pieces[corners];
     }
 
-    private static Tile? BackTile(Map map, Vector2 tile)
+    private static bool IsTilledGrass(Farm farm, Layer back, int x, int y)
     {
-        Layer back = map.GetLayer("Back");
-        if (tile.X < 0 || tile.Y < 0 || tile.X >= back.LayerWidth || tile.Y >= back.LayerHeight)
+        return GrassTile(back, x, y) != null && IsTilled(farm, x, y);
+    }
+
+    private static bool IsTilled(Farm farm, int x, int y)
+    {
+        return farm.terrainFeatures.TryGetValue(new Vector2(x, y), out var feature) && feature is HoeDirt;
+    }
+
+    /// <summary>Gets a Back tile that was grass on the original map, if any.</summary>
+    private static StaticTile? GrassTile(Layer back, int x, int y)
+    {
+        if (x < 0 || y < 0 || x >= back.LayerWidth || y >= back.LayerHeight)
             return null;
-        return back.Tiles[(int)tile.X, (int)tile.Y];
+        return back.Tiles[x, y] is StaticTile tile && IsOutdoorsSheet(tile.TileSheet) && IsGrass(tile.TileSheet, Original(tile)) ? tile : null;
+    }
+
+    private static int Original(StaticTile tile)
+    {
+        // The map is never saved, so the tile itself is the simplest place to remember what it was.
+        return tile.Properties.TryGetValue(GrassKey, out PropertyValue? original) ? original : tile.TileIndex;
     }
 
     private static bool IsOutdoorsSheet(TileSheet sheet)

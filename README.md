@@ -1,7 +1,7 @@
 # Tillable Farm Grass
 
 The permanent grass on your farm can be tilled with a hoe, so you can plant crops anywhere on it.
-Tilled grass turns into plain dirt, so your fields look even.
+Tilled grass turns into dirt that blends into the grass around it, and goes back to grass when you clear it.
 
 Works on every farm type, including Meadowlands and farms added by other mods. Existing saves pick
 it up on the next load, and removing the mod doesn't touch your save.
