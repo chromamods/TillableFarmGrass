@@ -3,10 +3,12 @@ using System.Collections.Generic;
 using System.Linq;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
+using Microsoft.Xna.Framework.Input;
 using HarmonyLib;
 using StardewModdingAPI;
 using StardewModdingAPI.Events;
 using StardewValley;
+using StardewValley.Menus;
 using StardewValley.TerrainFeatures;
 using StardewValley.Tools;
 using xTile;
@@ -26,9 +28,10 @@ internal sealed class ModEntry : Mod
     private const string ClearedKey = "ChromaMods.TillableFarmGrass/Cleared";
 
     /// <summary>Grass and half-grass tiles on the outdoors tile sheet that some farm maps don't type as grass.</summary>
+    /// <remarks>152 is the second frame of the animated flower grass 151, which only types its first frame.</remarks>
     private static readonly HashSet<int> GrassTiles = new()
     {
-        177, 178, 179, 180, 181, 182, 200, 201, 202, 203, 204, 205, 225, 228, 229, 230, 250, 251, 252, 253,
+        152, 177, 178, 179, 180, 181, 182, 200, 201, 202, 203, 204, 205, 225, 228, 229, 230, 250, 251, 252, 253,
         254, 255, 256, 261, 276, 277, 278, 286, 300, 304, 311, 328, 329, 332, 353, 354, 355, 356, 357, 378,
         379, 380, 381, 382, 401, 403, 404, 405, 406, 407, 423, 449, 567, 568, 569, 570, 592, 593, 594, 595,
         619, 631, 632, 635, 655, 656, 679, 683, 684, 705, 706, 1092, 1093, 1094, 1095, 1119, 1120, 1121
@@ -62,6 +65,7 @@ internal sealed class ModEntry : Mod
     public override void Entry(IModHelper helper)
     {
         helper.Events.Content.AssetRequested += OnAssetRequested;
+        helper.Events.GameLoop.GameLaunched += OnGameLaunched;
         var harmony = new Harmony(ModManifest.UniqueID);
         harmony.Patch(
             AccessTools.Method(typeof(Pickaxe), nameof(Pickaxe.DoFunction)),
@@ -69,6 +73,48 @@ internal sealed class ModEntry : Mod
         harmony.Patch(
             AccessTools.Method(typeof(GameLocation), nameof(GameLocation.drawFloorDecorations)),
             prefix: new HarmonyMethod(typeof(ModEntry), nameof(BeforeFloorDecorations)));
+    }
+
+    private void OnGameLaunched(object? sender, GameLaunchedEventArgs e)
+    {
+        var gmcm = Helper.ModRegistry.GetApi<IGenericModConfigMenuApi>("spacechase0.GenericModConfigMenu");
+        if (gmcm == null)
+            return;
+        gmcm.Register(ModManifest, reset: () => { }, save: () => { });
+        gmcm.AddComplexOption(
+            ModManifest,
+            name: () => "Restore cleared grass",
+            draw: RestoreButton(),
+            tooltip: () => "Turns all the grass you cleared with a pickaxe back into grass. Needs a save loaded.",
+            height: () => 56);
+    }
+
+    /// <summary>GMCM has no button option, so a complex option draws one and polls the mouse itself; it fires on release when the press began on it.</summary>
+    private static Action<SpriteBatch, Vector2> RestoreButton()
+    {
+        bool wasDown = false, pressed = false;
+        return (b, position) =>
+        {
+            const string label = "Restore";
+            Vector2 size = Game1.smallFont.MeasureString(label);
+            Rectangle bounds = new((int)position.X, (int)position.Y, (int)size.X + 40, 56);
+            bool enabled = Context.IsWorldReady && Game1.getFarm().modData.ContainsKey(ClearedKey);
+            bool hovered = enabled && bounds.Contains(Game1.getMouseX(), Game1.getMouseY());
+            bool down = Game1.input.GetMouseState().LeftButton == ButtonState.Pressed;
+            if (down && !wasDown)
+                pressed = hovered;
+            else if (!down && wasDown && pressed && hovered)
+            {
+                Game1.getFarm().modData.Remove(ClearedKey);
+                Game1.playSound("dirtyHit");
+            }
+            wasDown = down;
+
+            IClickableMenu.drawTextureBox(b, Game1.mouseCursors, new Rectangle(432, 439, 9, 9), bounds.X, bounds.Y, bounds.Width, bounds.Height,
+                (hovered ? Color.Wheat : Color.White) * (enabled ? 1f : 0.5f), 4f, false);
+            Utility.drawTextWithShadow(b, label, Game1.smallFont, new Vector2(bounds.X + 20, bounds.Y + (bounds.Height - size.Y) / 2),
+                Game1.textColor * (enabled ? 1f : 0.5f));
+        };
     }
 
     /// <summary>Clears farm grass to dirt when a pickaxe hits it with nothing on top, or turns cleared dirt back into grass.</summary>
@@ -192,14 +238,15 @@ internal sealed class ModEntry : Mod
 
     private static bool IsGrassTile(Layer back, int x, int y)
     {
-        return OutdoorsTile(back, x, y) is StaticTile tile && IsGrass(tile.TileSheet, tile.TileIndex);
+        return OutdoorsTile(back, x, y) is Tile tile && IsGrass(tile.TileSheet, tile.TileIndex);
     }
 
-    private static StaticTile? OutdoorsTile(Layer back, int x, int y)
+    /// <summary>Gets a ground tile on an outdoors sheet; an animated one reports its current frame's index.</summary>
+    private static Tile? OutdoorsTile(Layer back, int x, int y)
     {
         if (x < 0 || y < 0 || x >= back.LayerWidth || y >= back.LayerHeight)
             return null;
-        return back.Tiles[x, y] is StaticTile tile && IsOutdoorsSheet(tile.TileSheet) ? tile : null;
+        return back.Tiles[x, y] is Tile tile and (StaticTile or AnimatedTile) && IsOutdoorsSheet(tile.TileSheet) ? tile : null;
     }
 
     private static void LoadSheets(Map map, TileSheet main)
@@ -235,7 +282,7 @@ internal sealed class ModEntry : Mod
     }
 
     /// <summary>Builds the dirt drawn over a ground tile for the given dirt corners.</summary>
-    private static Texture2D Blend(StaticTile tile, int corners)
+    private static Texture2D Blend(Tile tile, int corners)
     {
         var key = (tile.TileSheet.Id, tile.TileIndex, corners);
         if (blends.TryGetValue(key, out Texture2D? texture))

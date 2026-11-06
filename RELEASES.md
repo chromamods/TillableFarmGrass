@@ -1,5 +1,9 @@
 # Releases
 
+## 1.5 (2026-11-06)
+- Flower grass can be tilled, cleared and blended like the rest of the grass.
+- With Generic Mod Config Menu, a Restore button turns all the grass you cleared back into grass.
+
 ## 1.4 (2026-11-06)
 - Hit farm grass with a pickaxe to clear it to dirt. Hit it again to bring the grass back.
 - Soft dirt edges on every shade of grass, in every season and with recolour mods.

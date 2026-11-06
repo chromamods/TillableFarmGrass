@@ -9,6 +9,8 @@ it up on the next load, and removing the mod doesn't touch your save.
 
 ## Requirements
 - Stardew Valley 1.6 and [SMAPI](https://smapi.io) 4.0+
+- Optional: [Generic Mod Config Menu](https://www.nexusmods.com/stardewvalley/mods/5098), for a button that
+  restores all the grass you cleared
 
 ## Install
 Drag the release zip into Vortex, or unzip it into `Stardew Valley/Mods`. In multiplayer, each
