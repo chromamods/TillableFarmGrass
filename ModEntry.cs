@@ -12,10 +12,11 @@ using xTile.Tiles;
 
 namespace TillableFarmGrass;
 
-/// <summary>Makes the permanent grass on every farm map tillable, and turns tilled grass into plain dirt.</summary>
+/// <summary>Makes the permanent grass on every farm map tillable, and shows tilled grass as plain dirt until the soil is gone.</summary>
 internal sealed class ModEntry : Mod
 {
-    private const string DirtKey = "ChromaMods.TillableFarmGrass/Dirt";
+    /// <summary>Tile property holding the grass a tilled tile showed before it became dirt.</summary>
+    private const string GrassKey = "ChromaMods.TillableFarmGrass/Grass";
 
     /// <summary>The plain tillable dirt on the outdoors tile sheet.</summary>
     private const int DirtTile = 587;
@@ -46,28 +47,25 @@ internal sealed class ModEntry : Mod
 
             // Restores tilled grass when the map is reloaded mid-session.
             if (Game1.getFarm() is Farm farm)
-            {
-                foreach (Vector2 tile in SavedDirt(farm))
-                    ToDirt(map, tile);
-            }
+                SyncDirt(farm, map);
         }, AssetEditPriority.Late);
     }
 
     private static void OnDayStarted(object? sender, DayStartedEventArgs e)
     {
+        // Covers soil tilled before the save loaded, and soil that dried up overnight.
         Farm farm = Game1.getFarm();
-        foreach (Vector2 tile in SavedDirt(farm))
-            ToDirt(farm.Map, tile);
-        foreach (var pair in farm.terrainFeatures.Pairs.Where(p => p.Value is HoeDirt))
-            Till(farm, pair.Key);
+        SyncDirt(farm, farm.Map);
     }
 
     private static void OnTerrainFeatureListChanged(object? sender, TerrainFeatureListChangedEventArgs e)
     {
         if (e.Location is not Farm farm)
             return;
+        foreach (var pair in e.Removed.Where(p => p.Value is HoeDirt))
+            Untill(farm.Map, pair.Key);
         foreach (var pair in e.Added.Where(p => p.Value is HoeDirt))
-            Till(farm, pair.Key);
+            Till(farm.Map, pair.Key);
     }
 
     private static IEnumerable<string> FarmMapNames()
@@ -93,35 +91,48 @@ internal sealed class ModEntry : Mod
         }
     }
 
-    /// <summary>Turns a newly tilled grass tile into dirt, and remembers it so it stays dirt.</summary>
-    private static void Till(Farm farm, Vector2 tile)
+    /// <summary>Shows dirt under every hoed tile of the farm, and grass again where the soil is gone.</summary>
+    private static void SyncDirt(Farm farm, Map map)
     {
-        // The host's record is the one that's saved and shared; other players convert their own copy.
-        if (ToDirt(farm.Map, tile) && Context.IsMainPlayer)
-            farm.modData[DirtKey] = (farm.modData.TryGetValue(DirtKey, out string? saved) ? saved + " " : "") + $"{(int)tile.X},{(int)tile.Y}";
+        Layer back = map.GetLayer("Back");
+        for (int x = 0; x < back.LayerWidth; x++)
+        {
+            for (int y = 0; y < back.LayerHeight; y++)
+            {
+                Vector2 tile = new(x, y);
+                if (farm.terrainFeatures.TryGetValue(tile, out var feature) && feature is HoeDirt)
+                    Till(map, tile);
+                else
+                    Untill(map, tile);
+            }
+        }
     }
 
-    private static bool ToDirt(Map map, Vector2 tile)
+    private static void Till(Map map, Vector2 tile)
+    {
+        if (BackTile(map, tile) is not StaticTile grass || !IsOutdoorsSheet(grass.TileSheet) || !IsGrass(grass.TileSheet, grass.TileIndex))
+            return;
+
+        // The map is never saved, so the tile itself is the simplest place to remember its grass.
+        grass.Properties[GrassKey] = grass.TileIndex;
+        grass.TileIndex = DirtTile;
+    }
+
+    private static void Untill(Map map, Vector2 tile)
+    {
+        if (BackTile(map, tile) is not StaticTile dirt || !dirt.Properties.TryGetValue(GrassKey, out PropertyValue? grass))
+            return;
+
+        dirt.TileIndex = grass;
+        dirt.Properties.Remove(GrassKey);
+    }
+
+    private static Tile? BackTile(Map map, Vector2 tile)
     {
         Layer back = map.GetLayer("Back");
         if (tile.X < 0 || tile.Y < 0 || tile.X >= back.LayerWidth || tile.Y >= back.LayerHeight)
-            return false;
-        if (back.Tiles[(int)tile.X, (int)tile.Y] is not StaticTile grass || !IsOutdoorsSheet(grass.TileSheet) || !IsGrass(grass.TileSheet, grass.TileIndex))
-            return false;
-
-        grass.TileIndex = DirtTile;
-        return true;
-    }
-
-    private static IEnumerable<Vector2> SavedDirt(Farm farm)
-    {
-        if (!farm.modData.TryGetValue(DirtKey, out string? saved))
-            yield break;
-        foreach (string entry in saved.Split(' '))
-        {
-            string[] xy = entry.Split(',');
-            yield return new Vector2(int.Parse(xy[0]), int.Parse(xy[1]));
-        }
+            return null;
+        return back.Tiles[(int)tile.X, (int)tile.Y];
     }
 
     private static bool IsOutdoorsSheet(TileSheet sheet)
